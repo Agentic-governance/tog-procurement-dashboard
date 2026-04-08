@@ -2244,7 +2244,7 @@ async def changes_page(days: int = Query(30), page: int = Query(1, ge=1)):
 # ── API Endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/api/items")
-async def api_items(days: int = 30, pref: str = None, q: str = None, limit: int = 100):
+async def api_items(days: int = 365, pref: str = None, q: str = None, limit: int = 100, offset: int = 0):
     conn = get_db()
     where = "WHERE p.detected_at > datetime('now', ?)"
     params = [f'-{days} days']
@@ -2260,8 +2260,8 @@ async def api_items(days: int = 30, pref: str = None, q: str = None, limit: int 
 
     items = conn.execute(f"""
         SELECT p.* FROM procurement_items p {where}
-        ORDER BY p.detected_at DESC LIMIT ?
-    """, params + [limit]).fetchall()
+        ORDER BY p.detected_at DESC LIMIT ? OFFSET ?
+    """, params + [limit, offset]).fetchall()
 
     result = []
     for item in items:
@@ -2289,6 +2289,39 @@ async def api_stats():
         'changes_30d': conn.execute("SELECT COUNT(*) FROM diffs WHERE detected_at > datetime('now', '-30 days')").fetchone()[0],
     }
     return JSONResponse(stats)
+
+
+
+
+@app.get("/api/quality")
+async def api_quality():
+    """Quality metrics for the intelligence system."""
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM procurement_items").fetchone()[0]
+    with_dl = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE deadline IS NOT NULL AND deadline != ''").fetchone()[0]
+    with_amt = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE amount IS NOT NULL AND amount != ''").fetchone()[0]
+    with_url = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE url IS NOT NULL AND url != '' AND length(url) > 10").fetchone()[0]
+    open_bids = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE deadline >= date('now')").fetchone()[0]
+    awards = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE item_type='award'").fetchone()[0]
+    munis = conn.execute("SELECT COUNT(DISTINCT muni_code) FROM procurement_items WHERE muni_code != 'NATIONAL'").fetchone()[0]
+    munis_10 = conn.execute("SELECT COUNT(*) FROM (SELECT muni_code FROM procurement_items WHERE muni_code != 'NATIONAL' GROUP BY muni_code HAVING COUNT(*) >= 10)").fetchone()[0]
+    vendors = conn.execute("SELECT COUNT(DISTINCT method) FROM procurement_items WHERE item_type='award' AND method != ''").fetchone()[0]
+    return {
+        'total_items': total,
+        'with_deadline': with_dl,
+        'with_amount': with_amt,
+        'with_url': with_url,
+        'open_bids': open_bids,
+        'awards': awards,
+        'municipalities': munis,
+        'municipalities_meaningful_10plus': munis_10,
+        'vendors_from_awards': vendors,
+        'quality_scores': {
+            'deadline_pct': round(with_dl * 100 / total, 1) if total else 0,
+            'amount_pct': round(with_amt * 100 / total, 1) if total else 0,
+            'url_pct': round(with_url * 100 / total, 1) if total else 0,
+        }
+    }
 
 
 @app.get("/api/export")
@@ -2623,7 +2656,7 @@ async def api_news(muni_code: str, limit: int = Query(20, ge=1, le=100)):
 @app.get("/api/v2/items")
 async def api_v2_items(
     days: int = 30, pref: str = None, q: str = None,
-    cat: str = None, dept: str = None, limit: int = 100
+    cat: str = None, dept: str = None, limit: int = 100, offset: int = 0
 ):
     """Enhanced items API with department and category fields."""
     conn = get_db()
@@ -2648,8 +2681,8 @@ async def api_v2_items(
 
     items = conn.execute(f"""
         SELECT p.* FROM procurement_items p {where}
-        ORDER BY p.detected_at DESC LIMIT ?
-    """, params + [limit]).fetchall()
+        ORDER BY p.detected_at DESC LIMIT ? OFFSET ?
+    """, params + [limit, offset]).fetchall()
 
     result = []
     for item in items:
@@ -7259,6 +7292,477 @@ async def api_pre_night11_pipeline():
     except Exception as e:
         import traceback
         return JSONResponse({"detail": str(e), "traceback": traceback.format_exc()}, status_code=400)
+
+
+# Night 12 API routes
+@app.post("/api/v12/deadline-extract/{project_id}")
+async def api_deadline_extract(project_id: int, request: Request):
+    """Extract deadlines for a project."""
+    from n12_stabilization import extract_deadlines
+    conn = get_db()
+    result = extract_deadlines(conn, project_id)
+    conn.close()
+    return result
+
+@app.post("/api/v12/deadline-extract-all")
+async def api_deadline_extract_all(request: Request):
+    """Extract deadlines for all active projects."""
+    from n12_stabilization import run_deadline_extraction
+    conn = get_db()
+    results = run_deadline_extraction(conn)
+    conn.close()
+    return {"results": results, "count": len(results), "with_deadline": sum(1 for r in results if r['deadlines'].get('deadline_main'))}
+
+@app.post("/api/v12/method-classify/{project_id}")
+async def api_method_classify(project_id: int, request: Request):
+    """Classify procurement method for a project."""
+    from n12_stabilization import classify_procurement_method
+    conn = get_db()
+    result = classify_procurement_method(conn, project_id)
+    conn.close()
+    return result
+
+@app.post("/api/v12/method-classify-all")
+async def api_method_classify_all(request: Request):
+    """Classify method for all active projects."""
+    from n12_stabilization import run_method_classification
+    conn = get_db()
+    results = run_method_classification(conn)
+    conn.close()
+    return {"results": results, "known": sum(1 for r in results if r['method'] != 'unknown')}
+
+@app.post("/api/v12/wp-calibrate-all")
+async def api_wp_calibrate_all(request: Request):
+    """Run full WP calibration pipeline."""
+    from n12_stabilization import run_deadline_extraction, run_method_classification, run_wp_calibration
+    conn = get_db()
+    dl = run_deadline_extraction(conn)
+    mt = run_method_classification(conn)
+    wp = run_wp_calibration(conn, dl, mt)
+    conn.close()
+    return {"results": wp, "mean_wp": sum(r['calibrated_wp'] for r in wp)/len(wp) if wp else 0}
+
+@app.post("/api/v12/strategy-rebalance-all")
+async def api_strategy_rebalance_all(request: Request):
+    """Run full stabilization pipeline."""
+    from n12_stabilization import run_night12_pipeline
+    result = run_night12_pipeline()
+    return {
+        "deadline_coverage": sum(1 for r in result['deadline_results'] if r['deadlines'].get('deadline_main')),
+        "method_known": sum(1 for r in result['method_results'] if r['method'] != 'unknown'),
+        "mean_wp": sum(r['calibrated_wp'] for r in result['wp_results'])/len(result['wp_results']) if result['wp_results'] else 0,
+        "strategy_changes": sum(1 for r in result['strategy_results'] if r['old_strategy'] != r['new_strategy']),
+        "tests_passed": sum(1 for r in result['test_results'] if r['passed']),
+    }
+
+@app.get("/api/v12/stabilization-status")
+async def api_stabilization_status(request: Request):
+    """Get current stabilization metrics."""
+    conn = get_db()
+    projects = conn.execute("""
+        SELECT bp.project_id, bp.strategy_type, bp.win_probability, bp.wp_confidence,
+               pi.deadline, pi.method
+        FROM bid_projects bp
+        JOIN procurement_items pi ON bp.item_id = pi.item_id
+        WHERE bp.status NOT IN ('archived','abandoned')
+    """).fetchall()
+    conn.close()
+    total = len(projects)
+    with_dl = sum(1 for p in projects if p[4] and str(p[4]) not in ('None',''))
+    with_mt = sum(1 for p in projects if p[5] and str(p[5]) not in ('None','','unknown'))
+    wps = [p[2] for p in projects if p[2] is not None]
+    from collections import Counter
+    strats = dict(Counter(p[1] for p in projects))
+    return {
+        "total_projects": total,
+        "deadline_coverage": f"{with_dl}/{total} ({with_dl/total*100:.1f}%)",
+        "method_coverage": f"{with_mt}/{total} ({with_mt/total*100:.1f}%)",
+        "mean_wp": round(sum(wps)/len(wps), 3) if wps else 0,
+        "strategy_distribution": strats,
+    }
+
+
+# === Night 14: Zero-Miss Pipeline API Routes ===
+
+@app.get("/api/v14/coverage-audit")
+async def api_coverage_audit():
+    """Coverage audit v3 results."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        # Score distribution
+        c.execute("""SELECT
+            SUM(CASE WHEN important_v3_score >= 50 THEN 1 ELSE 0 END) as critical,
+            SUM(CASE WHEN important_v3_score >= 30 AND important_v3_score < 50 THEN 1 ELSE 0 END) as high,
+            SUM(CASE WHEN important_v3_score >= 15 AND important_v3_score < 30 THEN 1 ELSE 0 END) as medium,
+            SUM(CASE WHEN important_v3_score < 15 THEN 1 ELSE 0 END) as low,
+            COUNT(*) as total
+            FROM procurement_items""")
+        row = c.fetchone()
+        dist = {"critical": row[0], "high": row[1], "medium": row[2], "low": row[3], "total": row[4]}
+
+        # Untracked critical
+        c.execute("""SELECT COUNT(*) FROM procurement_items
+                     WHERE important_v3_score >= 30
+                     AND item_id NOT IN (SELECT item_id FROM bid_projects)""")
+        untracked = c.fetchone()[0]
+
+        # Tracked
+        c.execute("SELECT COUNT(*) FROM bid_projects")
+        tracked = c.fetchone()[0]
+
+        # Top untracked
+        c.execute("""SELECT item_id, title, important_v3_score, item_type, muni_code
+                     FROM procurement_items
+                     WHERE important_v3_score >= 30
+                     AND item_id NOT IN (SELECT item_id FROM bid_projects)
+                     ORDER BY important_v3_score DESC LIMIT 20""")
+        top_untracked = [{"item_id": r[0], "title": r[1], "score": r[2], "type": r[3], "muni": r[4]}
+                         for r in c.fetchall()]
+
+        return {"score_distribution": dist, "untracked_critical": untracked,
+                "tracked": tracked, "top_untracked": top_untracked}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v14/attachment-status")
+async def api_attachment_status():
+    """Attachment parse status overview."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT parse_status, COUNT(*) FROM attachment_assets GROUP BY parse_status")
+        status_dist = {r[0]: r[1] for r in c.fetchall()}
+
+        c.execute("SELECT asset_type, COUNT(*) FROM attachment_assets GROUP BY asset_type ORDER BY COUNT(*) DESC")
+        type_dist = {r[0]: r[1] for r in c.fetchall()}
+
+        # Per-project
+        c.execute("""SELECT bp.project_id, bp.strategy_type,
+            (SELECT COUNT(*) FROM attachment_assets aa WHERE aa.procurement_item_id = bp.item_id) as total,
+            (SELECT COUNT(*) FROM attachment_assets aa WHERE aa.procurement_item_id = bp.item_id AND aa.parse_status = 'parsed') as parsed
+            FROM bid_projects bp ORDER BY bp.project_id""")
+        projects = [{"project_id": r[0], "strategy": r[1], "total": r[2], "parsed": r[3]} for r in c.fetchall()]
+
+        return {"status_distribution": status_dist, "type_distribution": type_dist, "projects": projects}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v14/resolve-attachments")
+async def api_resolve_attachments():
+    """Resolve pending attachments for priority items (max 20 per call)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("resolver", "/app/n14_attachment_resolver.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        results = mod.resolve_priority_attachments(conn, max_items=20)
+        return {"processed": results["processed"], "parsed": results["parsed"],
+                "errors": results["errors"], "skipped": results["skipped"]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v14/pipeline-v2")
+async def api_pipeline_v2():
+    """Pipeline V2 evaluation for all projects."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("n14", "/app/n14_zero_miss.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        results = mod.run_pipeline_evaluation(conn)
+        return results
+    finally:
+        conn.close()
+
+
+@app.get("/api/v14/pipeline-v2/{project_id}")
+async def api_pipeline_v2_project(project_id: int):
+    """Pipeline V2 evaluation for a single project."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("n14", "/app/n14_zero_miss.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        result = mod.evaluate_pipeline_stage(conn, project_id)
+        return result
+    finally:
+        conn.close()
+
+
+@app.get("/api/v14/data-quality-v2")
+async def api_data_quality_v2():
+    """Data quality V2 KPIs (depth-focused)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("n14", "/app/n14_zero_miss.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        results = mod.compute_data_quality_v2(conn)
+        return results
+    finally:
+        conn.close()
+
+
+@app.get("/api/v14/context-audit")
+async def api_context_audit():
+    """Context integration audit for proposals."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("n14", "/app/n14_zero_miss.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        results = mod.audit_context_integration(conn)
+        return results
+    finally:
+        conn.close()
+
+
+@app.get("/api/v14/important-items")
+async def api_important_items(min_score: int = 30, limit: int = 50):
+    """List important items by v3 score."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("""SELECT item_id, title, important_v3_score, item_type, category,
+                     muni_code, deadline, method
+                     FROM procurement_items
+                     WHERE important_v3_score >= ?
+                     ORDER BY important_v3_score DESC
+                     LIMIT ?""", (min_score, limit))
+        items = [{"item_id": r[0], "title": r[1], "score": r[2], "type": r[3],
+                  "category": r[4], "muni": r[5], "deadline": r[6], "method": r[7]}
+                 for r in c.fetchall()]
+        return {"items": items, "count": len(items)}
+    finally:
+        conn.close()
+
+
+# === End Night 14 Routes ===
+
+
+# === Day 1 Hardening Sprint: Workbench API Routes ===
+
+@app.get("/api/day1/backlog-stats")
+async def api_backlog_stats():
+    """Backlog queue statistics."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COUNT(*) FROM backlog_queue")
+        total = c.fetchone()[0]
+        c.execute("SELECT backlog_type, COUNT(*) FROM backlog_queue GROUP BY backlog_type ORDER BY COUNT(*) DESC")
+        by_type = {r[0]: r[1] for r in c.fetchall()}
+        c.execute("SELECT auto_action_status, COUNT(*) FROM backlog_queue GROUP BY auto_action_status")
+        by_status = {r[0]: r[1] for r in c.fetchall()}
+        return {"total": total, "by_type": by_type, "by_status": by_status}
+    finally:
+        conn.close()
+
+
+@app.get("/api/day1/backlog-items")
+async def api_backlog_items(backlog_type: str = None, limit: int = 50, offset: int = 0):
+    """Get backlog items with details."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        query = """SELECT bq.id, bq.procurement_item_id, bq.important_v3_score,
+                          bq.backlog_type, bq.priority_rank, bq.auto_action_status,
+                          pi.title, pi.category, pi.muni_code, pi.deadline
+                   FROM backlog_queue bq
+                   JOIN procurement_items pi ON pi.item_id = bq.procurement_item_id"""
+        params = []
+        if backlog_type:
+            query += " WHERE bq.backlog_type = ?"
+            params.append(backlog_type)
+        query += " ORDER BY bq.priority_rank ASC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        c.execute(query, params)
+        items = [{"id": r[0], "item_id": r[1], "score": r[2], "backlog_type": r[3],
+                  "priority_rank": r[4], "status": r[5], "title": r[6],
+                  "category": r[7], "muni_code": r[8], "deadline": r[9]}
+                 for r in c.fetchall()]
+        return {"items": items, "count": len(items)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/day1/context-stats")
+async def api_context_stats():
+    """Context enrichment statistics."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COUNT(*) FROM municipality_context_packs")
+        packs = c.fetchone()[0]
+        c.execute("SELECT AVG(quality_score) FROM municipality_context_packs")
+        avg_quality = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM proposal_drafts WHERE status = 'draft'")
+        drafts = c.fetchone()[0]
+        return {"context_packs": packs, "avg_pack_quality": round(avg_quality, 1),
+                "total_proposals": drafts}
+    finally:
+        conn.close()
+
+
+@app.get("/api/day1/pipeline-v2-stages")
+async def api_pipeline_v2_stages():
+    """Pipeline V2 stage distribution."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT current_stage, COUNT(*) FROM pipeline_v2_stages GROUP BY current_stage")
+        dist = {r[0]: r[1] for r in c.fetchall()}
+        stages = ['discovered', 'captured', 'detail_fetched', 'attachment_fetched',
+                  'parsed', 'context_enriched', 'proposal_ready', 'bundle_ready',
+                  'dryrun_ready', 'submission_ready']
+        for s in stages:
+            if s not in dist:
+                dist[s] = 0
+        return {"stages": dist, "total": sum(dist.values())}
+    finally:
+        conn.close()
+
+
+@app.get("/api/day1/pipeline-v2-bottlenecks")
+async def api_pipeline_bottlenecks():
+    """Pipeline V2 bottleneck analysis."""
+    import json as _json
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT current_stage, COUNT(*) FROM pipeline_v2_stages GROUP BY current_stage")
+        dist = dict(c.fetchall())
+        bottlenecks = []
+        for stage, count in sorted(dist.items(), key=lambda x: -x[1]):
+            if count >= 3:
+                c.execute("SELECT gate_checks_json FROM pipeline_v2_stages WHERE current_stage = ? LIMIT 5", (stage,))
+                checks = [_json.loads(r[0]) for r in c.fetchall() if r[0]]
+                missing = set()
+                for ch in checks:
+                    if not ch.get('has_attachments'): missing.add('attachments')
+                    if ch.get('parsed_count', 0) == 0: missing.add('parsed_text')
+                    if not ch.get('has_proposal'): missing.add('proposal')
+                    if not ch.get('has_context'): missing.add('context_pack')
+                bottlenecks.append({"stage": stage, "count": count, "common_missing": list(missing)})
+        return {"bottlenecks": bottlenecks}
+    finally:
+        conn.close()
+
+
+@app.get("/api/day1/attachment-failures")
+async def api_attachment_failures():
+    """Attachment failure taxonomy."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT failure_type, COUNT(*) FROM attachment_failures GROUP BY failure_type ORDER BY COUNT(*) DESC")
+        failures = [{"type": r[0], "count": r[1]} for r in c.fetchall()]
+        c.execute("SELECT COUNT(*) FROM attachment_failures")
+        total = c.fetchone()[0]
+        return {"total_failures": total, "by_type": failures}
+    finally:
+        conn.close()
+
+
+@app.get("/api/day1/dead-links")
+async def api_dead_links():
+    """Dead link analysis by domain."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("""SELECT aa.url FROM attachment_failures af
+                     JOIN attachment_assets aa ON aa.id = af.attachment_asset_id
+                     WHERE af.failure_type = 'http_404'""")
+        urls = [r[0] for r in c.fetchall() if r[0]]
+        from urllib.parse import urlparse
+        domains = {}
+        for url in urls:
+            try:
+                d = urlparse(url).netloc
+                domains[d] = domains.get(d, 0) + 1
+            except: pass
+        sorted_domains = sorted(domains.items(), key=lambda x: -x[1])
+        return {"total_dead": len(urls), "by_domain": [{"domain": d, "count": c2} for d, c2 in sorted_domains]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/day1/municipality-completeness/{muni_code}")
+async def api_muni_completeness(muni_code: str):
+    """Municipality data completeness."""
+    import json as _json
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        checks = {}
+        c.execute("SELECT COUNT(*) FROM procurement_items WHERE muni_code = ?", (muni_code,))
+        checks['items'] = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM muni_news WHERE muni_code = ?", (muni_code,))
+        checks['news'] = c.fetchone()[0]
+        c.execute("SELECT quality_score FROM municipality_context_packs WHERE muni_code = ?", (muni_code,))
+        ctx = c.fetchone()
+        checks['context_quality'] = ctx[0] if ctx else 0
+        c.execute("SELECT COUNT(*) FROM bid_projects bp JOIN procurement_items pi ON pi.item_id = bp.item_id WHERE pi.muni_code = ?", (muni_code,))
+        checks['projects'] = c.fetchone()[0]
+
+        score = 0
+        if checks['items'] > 0: score += 25
+        if checks['news'] > 0: score += 20
+        if checks['context_quality'] >= 30: score += 20
+        if checks['projects'] > 0: score += 15
+        checks['completeness_score'] = score
+
+        return checks
+    finally:
+        conn.close()
+
+
+@app.get("/api/day1/burndown-summary")
+async def api_burndown_summary():
+    """Overall burn-down sprint summary."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COUNT(*) FROM bid_projects")
+        total_projects = c.fetchone()[0]
+        c.execute("SELECT parse_status, COUNT(*) FROM attachment_assets GROUP BY parse_status")
+        att_status = {r[0]: r[1] for r in c.fetchall()}
+        c.execute("SELECT COUNT(*) FROM backlog_queue WHERE auto_action_status = 'pending'")
+        pending_backlog = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM municipality_context_packs")
+        context_packs = c.fetchone()[0]
+        c.execute("SELECT current_stage, COUNT(*) FROM pipeline_v2_stages GROUP BY current_stage")
+        pipeline = {r[0]: r[1] for r in c.fetchall()}
+
+        return {
+            "bid_projects": total_projects,
+            "attachments_parsed": att_status.get('parsed', 0),
+            "attachments_pending": att_status.get('pending', 0),
+            "attachments_error": att_status.get('error', 0),
+            "backlog_pending": pending_backlog,
+            "context_packs": context_packs,
+            "pipeline_stages": pipeline
+        }
+    finally:
+        conn.close()
+
+
+# === End Day 1 Routes ===
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=8007)
