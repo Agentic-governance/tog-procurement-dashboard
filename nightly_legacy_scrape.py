@@ -67,6 +67,24 @@ def cat(t):
             if k in t: return c
     return "other"
 
+def extract_dl(text):
+    """HTMLテキスト片からdeadline(YYYY-MM-DD)を抽出"""
+    if not text: return None
+    m = re.search(r'(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})', text)
+    if m:
+        y,mo,d = int(m.group(1)),int(m.group(2)),int(m.group(3))
+        if 2020<=y<=2030 and 1<=mo<=12 and 1<=d<=31:
+            return f"{y}-{mo:02d}-{d:02d}"
+    m = re.search(r'令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', text)
+    if m:
+        y=2018+int(m.group(1)); mo=int(m.group(2)); d=int(m.group(3))
+        if 1<=mo<=12 and 1<=d<=31: return f"{y}-{mo:02d}-{d:02d}"
+    m = re.search(r'[RＲ]\s*(\d{1,2})\s*[./]\s*(\d{1,2})\s*[./]\s*(\d{1,2})', text)
+    if m:
+        y=2018+int(m.group(1)); mo=int(m.group(2)); d=int(m.group(3))
+        if 1<=mo<=12 and 1<=d<=31: return f"{y}-{mo:02d}-{d:02d}"
+    return None
+
 def itype(method=""):
     if "一般" in method or "制限付" in method: return "general_competitive"
     if "プロポーザル" in method: return "proposal"
@@ -146,13 +164,19 @@ def scrape_supercals(cur):
                 "ejShousaiDispFlag": "", "BukyokuNO": "", "KoujiSyubetu": "",
             })
             count = 0
-            for t in re.findall(r'>([^<]{10,200})<', h):
+            chunks = re.findall(r'>([^<]{3,300})<', h)
+            for idx, t in enumerate(chunks):
                 t = t.strip()
                 if any(k in t for k in ["工事","業務","委託","設計","調査","測量","橋梁","舗装"]):
                     if not any(k in t for k in ["システム","トップ","メニュー","フレーム","ブラウザ","Explorer"]):
-                        cur.execute("INSERT OR IGNORE INTO procurement_items (muni_code,detected_at,title,item_type,url,category) VALUES (?,?,?,?,?,?)",
+                        # 後続チャンクからdeadline抽出
+                        dl = None
+                        for j in range(idx+1, min(idx+8, len(chunks))):
+                            dl = extract_dl(chunks[j])
+                            if dl: break
+                        cur.execute("INSERT OR IGNORE INTO procurement_items (muni_code,detected_at,title,item_type,deadline,url,category) VALUES (?,?,?,?,?,?,?)",
                             (muni, datetime.now().strftime("%Y-%m-%d"), t[:200], "general_competitive",
-                             f"{base}/ebidPPIPublish/EjPPIj", cat(t)))
+                             dl, f"{base}/ebidPPIPublish/EjPPIj", cat(t)))
                         count += cur.rowcount
             total += count
             log.info(f"  {name}: {count}")
@@ -178,14 +202,19 @@ def scrape_kanagawa(cur):
         try:
             h = get(o, f"{BASE}/DENTYO/P5000_INFORMATION?hdn_dantai={d}")
             count = 0
-            for t in re.findall(r'>([^<]{10,200})<', h):
+            chunks = re.findall(r'>([^<]{3,300})<', h)
+            for idx, t in enumerate(chunks):
                 t = t.strip()
                 if any(k in t for k in ["工事","業務","委託","設計","調査","プロポーザル","入札"]):
                     if not any(k in t for k in ["トップ","メニュー","サイト","フレーム"]):
                         mc = f"14{d[1:]}00" if len(d) == 4 else "140000"
-                        cur.execute("INSERT OR IGNORE INTO procurement_items (muni_code,detected_at,title,item_type,url,category) VALUES (?,?,?,?,?,?)",
+                        dl = None
+                        for j in range(idx+1, min(idx+8, len(chunks))):
+                            dl = extract_dl(chunks[j])
+                            if dl: break
+                        cur.execute("INSERT OR IGNORE INTO procurement_items (muni_code,detected_at,title,item_type,deadline,url,category) VALUES (?,?,?,?,?,?,?)",
                             (mc, datetime.now().strftime("%Y-%m-%d"), t[:200], "general_competitive",
-                             f"{BASE}/DENTYO/P5000_INFORMATION?hdn_dantai={d}", cat(t)))
+                             dl, f"{BASE}/DENTYO/P5000_INFORMATION?hdn_dantai={d}", cat(t)))
                         count += cur.rowcount
             total += count
         except:
@@ -255,12 +284,17 @@ def scrape_gunma(cur):
             o = mko()
             h = get(o, f"{BASE}/ebia/servlet/p?job=AcDantaiZTop&kikan_no={kikan}", enc="utf-8")
             count = 0
-            for t in re.findall(r'>([^<]{8,150})<', h):
+            chunks = re.findall(r'>([^<]{3,200})<', h)
+            for idx, t in enumerate(chunks):
                 t = t.strip()
                 if any(k in t for k in ["工事","業務","委託","購入","設計","調査","入札"]):
-                    cur.execute("INSERT OR IGNORE INTO procurement_items (muni_code,detected_at,title,item_type,url,category) VALUES (?,?,?,?,?,?)",
+                    dl = None
+                    for j in range(idx+1, min(idx+8, len(chunks))):
+                        dl = extract_dl(chunks[j])
+                        if dl: break
+                    cur.execute("INSERT OR IGNORE INTO procurement_items (muni_code,detected_at,title,item_type,deadline,url,category) VALUES (?,?,?,?,?,?,?)",
                         (muni, datetime.now().strftime("%Y-%m-%d"), t[:200], "general_competitive",
-                         f"{BASE}/ebia/servlet/p?job=AcDantaiZTop&kikan_no={kikan}", cat(t)))
+                         dl, f"{BASE}/ebia/servlet/p?job=AcDantaiZTop&kikan_no={kikan}", cat(t)))
                     count += cur.rowcount
             total += count
         except:
@@ -299,13 +333,18 @@ def scrape_efftis(cur):
                     for kbn in ["00", "01", "11"]:
                         h = get(o, f"{base}/PPUBC00100!link?screenId={screen}&chotatsu_kbn={kbn}&organizationNumber={kno}")
                         if not h or len(h) < 1000: continue
-                        for t in re.findall(r'>([^<]{10,150})<', h):
+                        chunks = re.findall(r'>([^<]{3,200})<', h)
+                        for idx, t in enumerate(chunks):
                             t = t.strip()
                             if any(k in t for k in ["工事","業務","委託","購入","設計","調査","プロポーザル"]):
                                 stype = "award" if screen == "PPUBC00400" else "general_competitive"
-                                cur.execute("INSERT OR IGNORE INTO procurement_items (muni_code,detected_at,title,item_type,url,category) VALUES (?,?,?,?,?,?)",
+                                dl = None
+                                for j in range(idx+1, min(idx+8, len(chunks))):
+                                    dl = extract_dl(chunks[j])
+                                    if dl: break
+                                cur.execute("INSERT OR IGNORE INTO procurement_items (muni_code,detected_at,title,item_type,deadline,url,category) VALUES (?,?,?,?,?,?,?)",
                                     (mc, datetime.now().strftime("%Y-%m-%d"), t[:200], stype,
-                                     f"{base}/PPUBC00100?kikanno={kno}", cat(t)))
+                                     dl, f"{base}/PPUBC00100?kikanno={kno}", cat(t)))
                                 total += cur.rowcount
                         time.sleep(0.2)
             except:

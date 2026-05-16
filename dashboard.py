@@ -3539,16 +3539,34 @@ def estimate_price_range(conn, category: str, muni_code: str = None) -> dict:
 
     amounts = []
     for r in rows:
-        amt_str = r['amount'] or ''
-        # Parse Japanese yen amounts
-        nums = re.findall(r'[\d,]+', amt_str.replace(',', ''))
-        for n in nums:
-            try:
-                val = int(n)
-                if val > 10000:  # > 1万円
-                    amounts.append(val)
-            except ValueError:
-                pass
+        amt_str = str(r['amount'] or '')
+        # Parse Japanese yen amounts with unit support
+        val = None
+        s = amt_str.replace(',', '').replace(' ', '').replace('　', '')
+        # 億万パターン
+        m_oku = re.search(r'([\d.]+)\s*億\s*([\d.]*)\s*万?', s)
+        if m_oku:
+            val = int(float(m_oku.group(1)) * 100_000_000 + (float(m_oku.group(2)) * 10_000 if m_oku.group(2) else 0))
+        if val is None:
+            m_man = re.search(r'([\d.]+)\s*万', s)
+            if m_man:
+                val = int(float(m_man.group(1)) * 10_000)
+        if val is None:
+            m_sen = re.search(r'([\d.]+)\s*千', s)
+            if m_sen:
+                val = int(float(m_sen.group(1)) * 1_000)
+        if val is None:
+            nums = re.findall(r'[\d]+', s)
+            for n in nums:
+                try:
+                    v = int(n)
+                    if v > 10000:
+                        val = v
+                        break
+                except ValueError:
+                    pass
+        if val and val > 10000:
+            amounts.append(val)
 
     if not amounts:
         return {'available': False, 'message': 'データ不足'}
