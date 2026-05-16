@@ -2299,7 +2299,7 @@ async def api_quality():
     conn = get_db()
     total = conn.execute("SELECT COUNT(*) FROM procurement_items").fetchone()[0]
     with_dl = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE deadline IS NOT NULL AND deadline != ''").fetchone()[0]
-    with_amt = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE amount IS NOT NULL AND amount != ''").fetchone()[0]
+    with_amt = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE (amount IS NOT NULL AND amount != '') OR (amount_numeric IS NOT NULL AND amount_numeric > 0)").fetchone()[0]
     with_url = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE url IS NOT NULL AND url != '' AND length(url) > 10").fetchone()[0]
     open_bids = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE deadline >= date('now')").fetchone()[0]
     awards = conn.execute("SELECT COUNT(*) FROM procurement_items WHERE item_type='award'").fetchone()[0]
